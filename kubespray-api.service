@@ -1,0 +1,36 @@
+[Unit]
+Description=Kubespray Scale API Server
+Documentation=https://github.com/your-repo/kubespray-scale-api
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/kubespray-scale-api
+
+# Environment
+Environment="PYTHONUNBUFFERED=1"
+
+# Main service
+ExecStart=/usr/bin/python3 /opt/kubespray-scale-api/kubespray_scale_api.py
+
+# Restart policy
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=kubespray-api
+
+# Security hardening (optional - uncomment if needed)
+# NoNewPrivileges=true
+# PrivateTmp=true
+
+# Resource limits
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
