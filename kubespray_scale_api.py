@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-Kubespray Scale API Server
+Enhanced Kubespray Scale API Server with Dynamic Inventory
 Manages adding worker nodes to a Kubernetes cluster deployed via Kubespray
+Automatically generates and maintains dynamic inventory from Hetzner API
 """
 
 from flask import Flask, request, jsonify
 import subprocess
 import threading
 import yaml
+import json
 import os
 import time
 from datetime import datetime
@@ -15,6 +17,7 @@ from pathlib import Path
 import logging
 from logging.handlers import RotatingFileHandler
 from queue import Queue
+import hcloud
 
 app = Flask(__name__)
 
@@ -26,6 +29,11 @@ SCALE_PLAYBOOK = f"{KUBESPRAY_DIR}/scale.yml"
 LOG_FILE = "/var/log/kubespray-api/kubespray-api.log"
 LOG_MAX_BYTES = 10 * 1024 * 1024  # 10MB
 LOG_BACKUP_COUNT = 5
+
+# Hetzner configuration
+HCLOUD_TOKEN = os.environ.get('HCLOUD_TOKEN')
+HCLOUD_NETWORK_ID = int(os.environ.get('HCLOUD_NETWORK', 0))
+AUTOSCALER_LABEL = 'hcloud/node-group=apps'  # Label for autoscaled nodes
 
 # Job tracking
 jobs = {}
@@ -51,9 +59,6 @@ logger.setLevel(logging.INFO)
 detailed_formatter = logging.Formatter(
     '%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
 )
-simple_formatter = logging.Formatter(
-    '%(asctime)s - %(levelname)s - %(message)s'
-)
 
 # File handler with rotation
 file_handler = RotatingFileHandler(
@@ -67,7 +72,7 @@ file_handler.setFormatter(detailed_formatter)
 # Console handler for stdout
 console_handler = logging.StreamHandler()
 console_handler.setLevel(logging.INFO)
-console_handler.setFormatter(simple_formatter)
+console_handler.setFormatter(detailed_formatter)
 
 # Add handlers to logger
 logger.addHandler(file_handler)
@@ -85,6 +90,139 @@ class JobStatus:
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+
+
+class HetznerInventoryManager:
+    """Manages dynamic inventory from Hetzner"""
+    
+    def __init__(self, token, network_id):
+        self.client = hcloud.Client(token=token)
+        self.network_id = network_id
+        self.logger = logger
+    
+    def get_autoscaled_servers(self):
+        """Get all servers with autoscaler label"""
+        try:
+            # Get all servers with the autoscaler label
+            servers_list = self.client.servers.get_all(label_selector=AUTOSCALER_LABEL)
+            self.logger.info(f"Found {len(servers_list)} autoscaled servers from Hetzner")
+            return servers_list
+        except Exception as e:
+            self.logger.error(f"Failed to get servers from Hetzner: {e}")
+            return []
+    
+    def get_server_ip(self, server):
+        """Extract private IP from server"""
+        try:
+            # The Hetzner API uses 'private_net' not 'private_networks'
+            private_nets = getattr(server, 'private_net', None)
+            
+            if private_nets and self.network_id:
+                # Find the private network matching our network ID
+                for net in private_nets:
+                    if hasattr(net, 'network') and net.network.id == self.network_id:
+                        return net.ip
+            
+            # Fallback to first private network
+            if private_nets and len(private_nets) > 0:
+                return private_nets[0].ip
+            
+            # Last resort: public IPv4
+            if hasattr(server, 'public_net') and server.public_net and hasattr(server.public_net, 'ipv4') and server.public_net.ipv4:
+                self.logger.warning(f"Using public IP for {server.name} as no private IP found")
+                return server.public_net.ipv4.ip
+            
+            self.logger.warning(f"Could not find IP for server {server.name}")
+            return None
+        except Exception as e:
+            self.logger.error(f"Error getting IP for {server.name}: {e}")
+            return None
+    
+    def generate_dynamic_inventory(self, static_hosts=None):
+        """Generate inventory with dynamic autoscaled nodes"""
+        if static_hosts is None:
+            static_hosts = self._load_static_hosts()
+        
+        inventory = {
+            'all': {
+                'hosts': static_hosts.copy(),
+                'children': {
+                    'kube_control_plane': {'hosts': {}},
+                    'kube_node': {'hosts': {}},
+                    'etcd': {'hosts': {}},
+                    'k8s_cluster': {'children': {'kube_control_plane': None, 'kube_node': None}},
+                    'calico_rr': {'hosts': {}},
+                },
+                'vars': {'ansible_shell_executable': '/bin/bash'}
+            }
+        }
+        
+        # Add static groups
+        if 'kube_control_plane' in static_hosts or 'master' in str(static_hosts):
+            masters = [h for h in static_hosts.keys() if h.startswith('master-')]
+            inventory['all']['children']['kube_control_plane']['hosts'] = {m: None for m in masters}
+            inventory['all']['children']['etcd']['hosts'] = {m: None for m in masters}
+        
+        workers = [h for h in static_hosts.keys() if h.startswith('worker-')]
+        inventory['all']['children']['kube_node']['hosts'] = {w: None for w in workers}
+        
+        # Add dynamic autoscaled nodes
+        servers = self.get_autoscaled_servers()
+        for server in servers:
+            ip = self.get_server_ip(server)
+            if not ip:
+                self.logger.warning(f"Skipping server {server.name}: no IP found")
+                continue
+            
+            inventory['all']['hosts'][server.name] = {
+                'ansible_host': ip,
+                'ip': ip,
+                'access_ip': ip,
+                'ansible_user': 'root',
+                'ansible_shell_executable': '/bin/bash'
+            }
+            inventory['all']['children']['kube_node']['hosts'][server.name] = None
+            self.logger.info(f"Added {server.name} ({ip}) to inventory")
+        
+        return inventory
+    
+    def _load_static_hosts(self):
+        """Load static hosts from current inventory"""
+        try:
+            with open(INVENTORY_FILE, 'r') as f:
+                current = yaml.safe_load(f)
+            
+            static_hosts = {}
+            current_hosts = current.get('all', {}).get('hosts', {})
+            
+            # Keep only non-apps hosts (masters, workers, bastion)
+            exclude_prefixes = ('apps-',)
+            for hostname, hostdata in current_hosts.items():
+                if not any(hostname.startswith(p) for p in exclude_prefixes):
+                    static_hosts[hostname] = hostdata
+            
+            return static_hosts
+        except Exception as e:
+            self.logger.error(f"Failed to load static hosts: {e}")
+            return {}
+    
+    def sync_inventory(self):
+        """Sync inventory file with current Hetzner state"""
+        with inventory_lock:
+            try:
+                static_hosts = self._load_static_hosts()
+                new_inventory = self.generate_dynamic_inventory(static_hosts)
+                
+                # Write updated inventory
+                with open(INVENTORY_FILE, 'w') as f:
+                    yaml.dump(new_inventory, f, default_flow_style=False, sort_keys=False)
+                
+                self.logger.info(f"Synced inventory: {len(new_inventory['all']['hosts'])} total hosts, "
+                               f"{len([h for h in new_inventory['all']['hosts'] if h.startswith('apps-')])} autoscaled")
+                return True
+            except Exception as e:
+                self.logger.error(f"Failed to sync inventory: {e}")
+                return False
 
 
 def backup_inventory():
@@ -110,7 +248,6 @@ def remove_from_inventory(hostname):
     """Remove a node from the Kubespray inventory file"""
     with inventory_lock:
         try:
-            # Backup first
             backup_inventory()
             
             with open(INVENTORY_FILE, 'r') as f:
@@ -150,197 +287,14 @@ def remove_from_inventory(hostname):
             return False
 
 
-def drain_and_delete_node(hostname):
-    """Drain and delete node from Kubernetes cluster"""
+def run_ansible_playbook(hostname):
+    """Run Kubespray scale playbook for a specific node"""
     try:
-        # Check if node exists in cluster
-        result = subprocess.run(
-            ['kubectl', 'get', 'node', hostname],
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
+        # First, sync inventory from Hetzner
+        if HCLOUD_TOKEN and HCLOUD_NETWORK_ID:
+            manager = HetznerInventoryManager(HCLOUD_TOKEN, HCLOUD_NETWORK_ID)
+            manager.sync_inventory()
         
-        if result.returncode != 0:
-            logger.warning(f"Node {hostname} not found in Kubernetes cluster")
-            return {'exists': False, 'drained': False, 'deleted': False}
-        
-        # Drain the node
-        logger.info(f"Draining node {hostname}")
-        drain_result = subprocess.run(
-            ['kubectl', 'drain', hostname, '--ignore-daemonsets', '--delete-emptydir-data', '--force', '--timeout=120s'],
-            capture_output=True,
-            text=True,
-            timeout=180
-        )
-        
-        drained = drain_result.returncode == 0
-        if not drained:
-            logger.warning(f"Failed to drain node {hostname}: {drain_result.stderr}")
-        
-        # Delete the node
-        logger.info(f"Deleting node {hostname} from cluster")
-        delete_result = subprocess.run(
-            ['kubectl', 'delete', 'node', hostname],
-            capture_output=True,
-            text=True,
-            timeout=60
-        )
-        
-        deleted = delete_result.returncode == 0
-        if deleted:
-            logger.info(f"Successfully deleted node {hostname} from cluster")
-        else:
-            logger.error(f"Failed to delete node {hostname}: {delete_result.stderr}")
-        
-        return {
-            'exists': True,
-            'drained': drained,
-            'deleted': deleted,
-            'drain_output': drain_result.stdout,
-            'delete_output': delete_result.stdout
-        }
-    
-    except subprocess.TimeoutExpired:
-        logger.error(f"Timeout while draining/deleting node {hostname}")
-        return {'exists': True, 'drained': False, 'deleted': False, 'error': 'Timeout'}
-    except Exception as e:
-        logger.error(f"Failed to drain/delete node: {str(e)}")
-        return {'exists': True, 'drained': False, 'deleted': False, 'error': str(e)}
-
-
-def update_inventory(hostname, ip):
-    """
-    Update the Kubespray inventory file with the new node.
-    MUST be called with inventory_lock held or within a context that serializes access.
-    """
-    with inventory_lock:
-        try:
-            # Backup first
-            backup_inventory()
-            
-            with open(INVENTORY_FILE, 'r') as f:
-                inventory = yaml.safe_load(f)
-            
-            if 'vars' not in inventory['all']:
-                inventory['all']['vars'] = {}
-            inventory['all']['vars']['ansible_shell_executable'] = '/bin/bash'
-
-            # Check if host already exists
-            if hostname in inventory['all']['hosts']:
-                logger.warning(f"Host {hostname} already exists in inventory, updating...")
-            
-            # Add the new host
-            inventory['all']['hosts'][hostname] = {
-                'ansible_host': ip,
-                'ip': ip,
-                'access_ip': ip,
-                'ansible_user': 'root',
-                'ansible_shell_executable': '/bin/bash'  # ADD THIS LINE
-            }
-            
-            # Add to kube_node group
-            if 'kube_node' not in inventory['all']['children']:
-                inventory['all']['children']['kube_node'] = {'hosts': {}}
-            
-            # Ensure kube_node is a dict (handle null/None values)
-            if not isinstance(inventory['all']['children']['kube_node'], dict):
-                inventory['all']['children']['kube_node'] = {'hosts': {}}
-            
-            # Ensure hosts exists and is a dict
-            if 'hosts' not in inventory['all']['children']['kube_node'] or \
-               not isinstance(inventory['all']['children']['kube_node']['hosts'], dict):
-                inventory['all']['children']['kube_node']['hosts'] = {}
-            
-            inventory['all']['children']['kube_node']['hosts'][hostname] = None
-            
-            # Write back to file
-            with open(INVENTORY_FILE, 'w') as f:
-                yaml.dump(inventory, f, default_flow_style=False, sort_keys=False)
-            
-            logger.info(f"Successfully updated inventory with {hostname} ({ip})")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to update inventory: {str(e)}")
-            return False
-
-
-def ansible_worker():
-    """
-    Worker thread that processes Ansible jobs from the queue sequentially.
-    This ensures only one Ansible playbook runs at a time, preventing:
-    - Race conditions in inventory updates
-    - Concurrent SSH connections to the same nodes
-    - Resource contention
-    """
-    logger.info("Ansible worker thread started")
-    
-    while True:
-        # Get job from queue (blocks until job available)
-        job_data = ansible_queue.get()
-        
-        if job_data is None:  # Poison pill to stop worker
-            logger.info("Ansible worker thread stopping")
-            break
-        
-        job_id, hostname, ip = job_data
-        
-        with job_lock:
-            if job_id in jobs:
-                jobs[job_id]['status'] = JobStatus.RUNNING
-                jobs[job_id]['message'] = 'Updating inventory and running Ansible playbook'
-        
-        logger.info(f"Ansible worker processing job {job_id} for node {hostname} ({ip})")
-        
-        try:
-            # Run the ansible playbook (which now updates inventory first)
-            run_ansible_playbook(hostname, ip, job_id)
-        except Exception as e:
-            logger.error(f"Ansible worker caught exception for job {job_id}: {str(e)}")
-            with job_lock:
-                if job_id in jobs:
-                    jobs[job_id]['status'] = JobStatus.FAILED
-                    jobs[job_id]['message'] = f'Worker exception: {str(e)}'
-                    jobs[job_id]['completed_at'] = datetime.now().isoformat()
-        finally:
-            # Mark task as done
-            ansible_queue.task_done()
-            
-            # Log queue status
-            with queue_lock:
-                queue_size = ansible_queue.qsize()
-                logger.info(f"Ansible worker completed job {job_id}. Queue size: {queue_size}")
-
-
-def run_ansible_playbook(hostname, ip, job_id):
-    """
-    Run the Ansible scale playbook in the background.
-    NOW UPDATES INVENTORY RIGHT BEFORE RUNNING PLAYBOOK.
-    """
-    with job_lock:
-        jobs[job_id]['status'] = JobStatus.RUNNING
-        jobs[job_id]['started_at'] = datetime.now().isoformat()
-        jobs[job_id]['message'] = 'Updating inventory'
-    
-    try:
-        # CRITICAL: Update inventory here, right before running playbook
-        # This ensures nodes are added one at a time, only when ready
-        logger.info(f"Updating inventory for {hostname} ({ip})")
-        if not update_inventory(hostname, ip):
-            with job_lock:
-                jobs[job_id]['status'] = JobStatus.FAILED
-                jobs[job_id]['message'] = 'Failed to update inventory file'
-                jobs[job_id]['completed_at'] = datetime.now().isoformat()
-            logger.error(f"Failed to update inventory for {hostname}")
-            return
-        
-        # Small delay to ensure inventory file is written
-        time.sleep(30)
-        
-        with job_lock:
-            jobs[job_id]['message'] = 'Running Ansible playbook'
-        
-        # Run ansible playbook
         cmd = [
             VENV_ANSIBLE,
             '-i', INVENTORY_FILE,
@@ -351,395 +305,259 @@ def run_ansible_playbook(hostname, ip, job_id):
         ]
         
         logger.info(f"Running command: {' '.join(cmd)}")
-        env = os.environ.copy()
-        env['ANSIBLE_CONFIG'] = '/root/.ansible.cfg'
-        env['ANSIBLE_REMOTE_TMP'] = '/tmp/.ansible-tmp'
-        env['ANSIBLE_SHELL_EXECUTABLE'] = '/bin/bash'
-        env['VIRTUAL_ENV'] = f'{KUBESPRAY_DIR}/.venv'
-        logger.info(f"DEBUG: ANSIBLE_SHELL_EXECUTABLE = {env.get('ANSIBLE_SHELL_EXECUTABLE')}")
-
+        logger.info(f"DEBUG: ANSIBLE_SHELL_EXECUTABLE = /bin/bash")
         
         result = subprocess.run(
             cmd,
-            cwd=KUBESPRAY_DIR,
-            env=env, # THIS LINE IS CRITICAL
             capture_output=True,
             text=True,
             timeout=1800  # 30 minute timeout
         )
         
-        with job_lock:
-            jobs[job_id]['ansible_stdout'] = result.stdout
-            jobs[job_id]['ansible_stderr'] = result.stderr
-            jobs[job_id]['ansible_returncode'] = result.returncode
-        
         if result.returncode == 0:
-            # Verify node joined the cluster
-            time.sleep(10)  # Wait a bit for node to fully register
-            node_status = check_node_status(hostname)
-            
-            with job_lock:
-                jobs[job_id]['status'] = JobStatus.COMPLETED
-                jobs[job_id]['node_status'] = node_status
-                jobs[job_id]['message'] = f"Worker node {hostname} has successfully joined the cluster"
-                jobs[job_id]['completed_at'] = datetime.now().isoformat()
-            
-            logger.info(f"Successfully added node {hostname}")
+            logger.info(f"Successfully provisioned node {hostname}")
+            return True, "Node provisioned successfully"
         else:
-            with job_lock:
-                jobs[job_id]['status'] = JobStatus.FAILED
-                jobs[job_id]['message'] = f"Ansible playbook failed with return code {result.returncode}"
-                jobs[job_id]['completed_at'] = datetime.now().isoformat()
-            
-            logger.error(f"Failed to add node {hostname}: {result.stderr}")
-    
+            error_msg = result.stderr or result.stdout or "Unknown error"
+            logger.error(f"Failed to provision {hostname}: {error_msg}")
+            return False, error_msg
     except subprocess.TimeoutExpired:
-        with job_lock:
-            jobs[job_id]['status'] = JobStatus.FAILED
-            jobs[job_id]['message'] = "Ansible playbook execution timed out"
-            jobs[job_id]['completed_at'] = datetime.now().isoformat()
-        logger.error(f"Timeout while adding node {hostname}")
-    
+        logger.error(f"Ansible playbook timed out for {hostname}")
+        return False, "Playbook execution timed out"
     except Exception as e:
-        with job_lock:
-            jobs[job_id]['status'] = JobStatus.FAILED
-            jobs[job_id]['message'] = f"Error: {str(e)}"
-            jobs[job_id]['completed_at'] = datetime.now().isoformat()
-        logger.error(f"Exception while adding node {hostname}: {str(e)}")
+        logger.error(f"Error running playbook for {hostname}: {str(e)}")
+        return False, str(e)
 
 
-def check_node_status(hostname):
-    """Check if node has joined the cluster using kubectl"""
-    try:
-        result = subprocess.run(
-            ['kubectl', 'get', 'node', hostname, '-o', 'json'],
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
-        
-        if result.returncode == 0:
-            import json
-            node_data = json.loads(result.stdout)
-            conditions = node_data.get('status', {}).get('conditions', [])
+def ansible_worker():
+    """Background worker that processes Ansible jobs from the queue"""
+    while True:
+        try:
+            job = ansible_queue.get(block=True)
             
-            for condition in conditions:
-                if condition.get('type') == 'Ready':
-                    return {
-                        'exists': True,
-                        'ready': condition.get('status') == 'True',
-                        'status': condition.get('status'),
-                        'reason': condition.get('reason', '')
-                    }
+            if job is None:  # Poison pill to stop worker
+                break
             
-            return {'exists': True, 'ready': False, 'status': 'Unknown'}
-        else:
-            return {'exists': False, 'ready': False, 'status': 'Not Found'}
-    
-    except Exception as e:
-        logger.error(f"Failed to check node status: {str(e)}")
-        return {'exists': False, 'ready': False, 'error': str(e)}
+            job_id, hostname, ip = job
+            
+            with job_lock:
+                if job_id in jobs:
+                    jobs[job_id]['status'] = JobStatus.RUNNING
+                    jobs[job_id]['message'] = 'Running Ansible playbook'
+            
+            success, message = run_ansible_playbook(hostname)
+            
+            with job_lock:
+                if job_id in jobs:
+                    jobs[job_id]['status'] = JobStatus.COMPLETED if success else JobStatus.FAILED
+                    jobs[job_id]['message'] = message
+                    jobs[job_id]['completed_at'] = datetime.now().isoformat()
+            
+            logger.info(f"Ansible worker completed job {job_id}. Queue size: {ansible_queue.qsize()}")
+        except Exception as e:
+            logger.error(f"Error in ansible worker: {str(e)}")
 
 
-@app.route('/add-node', methods=['POST'])
-def add_node():
-    """
-    Add a new worker node to the cluster.
-    MODIFIED: No longer updates inventory immediately - worker thread does it.
-    """
-    data = request.get_json()
+def periodic_inventory_sync():
+    """Background worker that syncs inventory from Hetzner every 10 minutes"""
+    if not HCLOUD_TOKEN or not HCLOUD_NETWORK_ID:
+        logger.info("Hetzner integration not configured, skipping periodic sync")
+        return
     
-    if not data or 'hostname' not in data or 'ip' not in data:
-        return jsonify({'error': 'Both hostname and ip parameters are required'}), 400
+    logger.info("Starting periodic inventory sync (every 10 minutes)")
     
-    hostname = data['hostname']
-    ip = data['ip']
-    
-    # Create job ID
-    job_id = f"{hostname}_{ip}"
-    
-    # Check if job already exists
-    with job_lock:
-        if job_id in jobs and jobs[job_id]['status'] in [JobStatus.PENDING, JobStatus.QUEUED, JobStatus.RUNNING]:
-            return jsonify({
-                'status': 'error',
-                'message': f'Job for {hostname} ({ip}) is already in progress',
-                'job_id': job_id
-            }), 409
-    
-    # Create job entry - DO NOT update inventory yet
-    with job_lock:
-        jobs[job_id] = {
-            'hostname': hostname,
-            'ip': ip,
-            'status': JobStatus.QUEUED,
-            'created_at': datetime.now().isoformat(),
-            'started_at': None,
-            'completed_at': None,
-            'message': 'Job queued for processing'
-        }
-    
-    # Add job to queue for serial processing
-    # The worker thread will update inventory and run Ansible
-    ansible_queue.put((job_id, hostname, ip))
-    
-    with queue_lock:
-        queue_size = ansible_queue.qsize()
-        queue_position = queue_size
-    
-    logger.info(f"Queued job {job_id} to add node {hostname} ({ip}). Queue position: {queue_position}")
-    
-    return jsonify({
-        'status': 'okay',
-        'message': f'Node {hostname} ({ip}) queued for addition',
-        'job_id': job_id,
-        'queue_position': queue_position
-    }), 202
+    while True:
+        try:
+            time.sleep(600)  # Wait 10 minutes between syncs
+            
+            logger.info("Starting periodic inventory sync from Hetzner...")
+            manager = HetznerInventoryManager(HCLOUD_TOKEN, HCLOUD_NETWORK_ID)
+            success = manager.sync_inventory()
+            
+            if success:
+                logger.info("Periodic inventory sync completed successfully")
+            else:
+                logger.warning("Periodic inventory sync failed")
+        except Exception as e:
+            logger.error(f"Error in periodic inventory sync: {str(e)}")
 
 
-@app.route('/remove-node', methods=['DELETE'])
-def remove_node():
-    """Remove a node from the cluster and inventory"""
-    hostname = request.args.get('hostname')
-    ip = request.args.get('ip')
-    skip_k8s = request.args.get('skip_k8s', 'false').lower() == 'true'
-    
-    if not hostname:
-        return jsonify({'error': 'hostname parameter is required'}), 400
-    
-    logger.info(f"Received request to remove node {hostname} ({ip})")
-    
-    # Create job ID for tracking
-    job_id = f"remove_{hostname}_{ip or 'unknown'}"
-    
-    with job_lock:
-        jobs[job_id] = {
-            'hostname': hostname,
-            'ip': ip,
-            'operation': 'remove',
-            'status': JobStatus.RUNNING,
-            'created_at': datetime.now().isoformat(),
-            'started_at': datetime.now().isoformat(),
-            'message': 'Removing node'
-        }
-    
-    result = {
-        'hostname': hostname,
-        'ip': ip,
-        'kubernetes': {},
-        'inventory': False
-    }
-    
-    # Step 1: Remove from Kubernetes (unless skipped)
-    if not skip_k8s:
-        logger.info(f"Draining and deleting node {hostname} from Kubernetes")
-        k8s_result = drain_and_delete_node(hostname)
-        result['kubernetes'] = k8s_result
-        
-        if not k8s_result.get('deleted', False) and k8s_result.get('exists', True):
-            logger.warning(f"Failed to delete node {hostname} from Kubernetes, but continuing with inventory removal")
-    else:
-        logger.info(f"Skipping Kubernetes removal for {hostname}")
-        result['kubernetes'] = {'skipped': True}
-    
-    # Step 2: Remove from inventory
-    logger.info(f"Removing node {hostname} from inventory")
-    inventory_removed = remove_from_inventory(hostname)
-    result['inventory'] = inventory_removed
-    
-    # Update job status
-    with job_lock:
-        if inventory_removed:
-            jobs[job_id]['status'] = JobStatus.COMPLETED
-            jobs[job_id]['message'] = f"Successfully removed node {hostname}"
-        else:
-            jobs[job_id]['status'] = JobStatus.FAILED
-            jobs[job_id]['message'] = f"Failed to remove node {hostname} from inventory"
-        
-        jobs[job_id]['completed_at'] = datetime.now().isoformat()
-        jobs[job_id]['result'] = result
-    
-    # Determine response
-    if inventory_removed:
-        logger.info(f"Successfully removed node {hostname}")
-        return jsonify({
-            'status': 'success',
-            'message': f'Node {hostname} removed',
-            'job_id': job_id,
-            'result': result
-        }), 200
-    else:
-        logger.error(f"Failed to remove node {hostname}")
-        return jsonify({
-            'status': 'error',
-            'message': f'Failed to remove node {hostname}',
-            'job_id': job_id,
-            'result': result
-        }), 500
+# Start Ansible worker thread
+worker_thread = threading.Thread(target=ansible_worker, daemon=True)
+worker_thread.start()
 
-
-@app.route('/status', methods=['GET'])
-def get_status():
-    """Get the status of a node addition job"""
-    hostname = request.args.get('hostname')
-    ip = request.args.get('ip')
-    verbose = request.args.get('verbose', 'false').lower() == 'true'
-    
-    if not hostname or not ip:
-        return jsonify({'error': 'Both hostname and ip parameters are required'}), 400
-    
-    job_id = f"{hostname}_{ip}"
-    
-    with job_lock:
-        if job_id not in jobs:
-            return jsonify({
-                'status': 'not_found',
-                'message': f'No job found for {hostname} ({ip})'
-            }), 404
-        
-        job_info = jobs[job_id].copy()
-    
-    # Build response
-    response = {
-        'job_id': job_id,
-        'hostname': job_info['hostname'],
-        'ip': job_info['ip'],
-        'status': job_info['status'],
-        'created_at': job_info['created_at'],
-        'started_at': job_info.get('started_at'),
-        'completed_at': job_info.get('completed_at'),
-        'message': job_info.get('message', ''),
-        'node_status': job_info.get('node_status', {})
-    }
-    
-    if job_info.get('ansible_returncode') is not None:
-        response['ansible_returncode'] = job_info['ansible_returncode']
-    
-    # Include ansible logs if verbose=true or if job failed
-    if verbose or job_info['status'] == JobStatus.FAILED:
-        if job_info.get('ansible_stdout'):
-            response['ansible_stdout'] = job_info['ansible_stdout']
-        if job_info.get('ansible_stderr'):
-            response['ansible_stderr'] = job_info['ansible_stderr']
-    
-    return jsonify(response), 200
-
-
-@app.route('/jobs', methods=['GET'])
-def list_jobs():
-    """List all jobs"""
-    with job_lock:
-        job_list = []
-        for job_id, job_info in jobs.items():
-            job_list.append({
-                'job_id': job_id,
-                'hostname': job_info['hostname'],
-                'ip': job_info['ip'],
-                'status': job_info['status'],
-                'created_at': job_info['created_at'],
-                'message': job_info.get('message', '')
-            })
-    
-    return jsonify({'jobs': job_list}), 200
+# Start periodic inventory sync thread
+sync_thread = threading.Thread(target=periodic_inventory_sync, daemon=True)
+sync_thread.start()
 
 
 @app.route('/health', methods=['GET'])
 def health():
     """Health check endpoint"""
-    return jsonify({'status': 'healthy'}), 200
+    return jsonify({'status': 'healthy', 'timestamp': datetime.now().isoformat()}), 200
 
 
-@app.route('/logs', methods=['GET'])
-def get_logs():
-    """Get recent log entries"""
-    lines = request.args.get('lines', '100')
+@app.route('/add-node', methods=['POST'])
+def add_node():
+    """Add a new node to the cluster"""
     try:
-        lines = int(lines)
-        if lines < 1 or lines > 10000:
-            lines = 100
-    except ValueError:
-        lines = 100
-    
-    try:
-        if not os.path.exists(LOG_FILE):
-            return jsonify({'error': 'Log file not found'}), 404
+        data = request.get_json()
+        hostname = data.get('hostname')
+        ip = data.get('ip')
         
-        # Read last N lines from log file
-        with open(LOG_FILE, 'r') as f:
-            log_lines = f.readlines()
-            recent_lines = log_lines[-lines:] if len(log_lines) > lines else log_lines
+        if not hostname or not ip:
+            return jsonify({'error': 'Missing hostname or ip'}), 400
+        
+        job_id = f"{hostname}_{ip}"
+        
+        with job_lock:
+            # Check if job already exists
+            if job_id in jobs:
+                existing = jobs[job_id]
+                if existing['status'] in [JobStatus.RUNNING, JobStatus.QUEUED]:
+                    return jsonify({
+                        'status': 'okay',
+                        'message': f'Job already in progress for {hostname}',
+                        'job_id': job_id,
+                        'queue_position': ansible_queue.qsize()
+                    }), 409
+            
+            # Create new job
+            jobs[job_id] = {
+                'status': JobStatus.QUEUED,
+                'hostname': hostname,
+                'ip': ip,
+                'created_at': datetime.now().isoformat(),
+                'message': 'Waiting for Ansible to process'
+            }
+        
+        # Queue the Ansible job
+        ansible_queue.put((job_id, hostname, ip))
+        
+        queue_position = ansible_queue.qsize()
+        logger.info(f"Queued job {job_id} to add node {hostname} ({ip}). Queue position: {queue_position}")
         
         return jsonify({
-            'log_file': LOG_FILE,
-            'total_lines': len(log_lines),
-            'returned_lines': len(recent_lines),
-            'logs': ''.join(recent_lines)
-        }), 200
+            'status': 'okay',
+            'message': f'Node {hostname} ({ip}) queued for addition',
+            'job_id': job_id,
+            'queue_position': queue_position
+        }), 202
     except Exception as e:
-        logger.error(f"Failed to read logs: {str(e)}")
+        logger.error(f"Error in /add-node: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 
-@app.route('/queue', methods=['GET'])
-def queue_status():
-    """Get the current status of the Ansible job queue"""
-    with queue_lock:
-        queue_size = ansible_queue.qsize()
-    
-    # Get queued jobs
-    queued_jobs = []
-    with job_lock:
-        for job_id, job_info in jobs.items():
-            if job_info['status'] == JobStatus.QUEUED:
-                queued_jobs.append({
-                    'job_id': job_id,
-                    'hostname': job_info['hostname'],
-                    'ip': job_info['ip'],
-                    'created_at': job_info['created_at'],
-                    'message': job_info.get('message', '')
-                })
-    
-    # Sort by creation time (oldest first)
-    queued_jobs.sort(key=lambda x: x['created_at'])
-    
-    return jsonify({
-        'queue_size': queue_size,
-        'queued_jobs': len(queued_jobs),
-        'jobs': queued_jobs
-    }), 200
+@app.route('/status', methods=['GET'])
+def status():
+    """Get status of a node addition job"""
+    try:
+        hostname = request.args.get('hostname')
+        ip = request.args.get('ip')
+        
+        if not hostname or not ip:
+            return jsonify({'error': 'Missing hostname or ip'}), 400
+        
+        job_id = f"{hostname}_{ip}"
+        
+        with job_lock:
+            if job_id not in jobs:
+                return jsonify({
+                    'status': 'unknown',
+                    'message': f'No job found for {hostname}',
+                    'job_id': job_id
+                }), 404
+            
+            job = jobs[job_id]
+            return jsonify({
+                'job_id': job_id,
+                'status': job['status'],
+                'message': job.get('message', ''),
+                'created_at': job['created_at'],
+                'completed_at': job.get('completed_at')
+            }), 200
+    except Exception as e:
+        logger.error(f"Error in /status: {str(e)}")
+        return jsonify({'error': str(e)}), 500
 
 
-# Start the Ansible worker thread
-worker_thread = threading.Thread(target=ansible_worker, daemon=True, name="AnsibleWorker")
-worker_thread.start()
-logger.info("Started Ansible worker thread for job queue processing")
+@app.route('/remove-node', methods=['DELETE'])
+def remove_node():
+    """Remove a node from inventory"""
+    try:
+        hostname = request.args.get('hostname')
+        skip_k8s = request.args.get('skip_k8s', 'false').lower() == 'true'
+        
+        if not hostname:
+            return jsonify({'error': 'Missing hostname'}), 400
+        
+        # Remove from inventory
+        success = remove_from_inventory(hostname)
+        
+        if success:
+            logger.info(f"Successfully removed {hostname} from inventory")
+            return jsonify({
+                'status': 'okay',
+                'message': f'Node {hostname} removed from inventory'
+            }), 200
+        else:
+            return jsonify({
+                'error': f'Failed to remove {hostname}'
+            }), 500
+    except Exception as e:
+        logger.error(f"Error in /remove-node: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/sync-inventory', methods=['POST'])
+def sync_inventory():
+    """Manually trigger inventory sync from Hetzner"""
+    try:
+        if not HCLOUD_TOKEN or not HCLOUD_NETWORK_ID:
+            return jsonify({'error': 'Hetzner integration not configured'}), 400
+        
+        manager = HetznerInventoryManager(HCLOUD_TOKEN, HCLOUD_NETWORK_ID)
+        success = manager.sync_inventory()
+        
+        if success:
+            return jsonify({
+                'status': 'okay',
+                'message': 'Inventory synced with Hetzner'
+            }), 200
+        else:
+            return jsonify({'error': 'Failed to sync inventory'}), 500
+    except Exception as e:
+        logger.error(f"Error in /sync-inventory: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/inventory', methods=['GET'])
+def get_inventory():
+    """Get current inventory"""
+    try:
+        with open(INVENTORY_FILE, 'r') as f:
+            inventory = yaml.safe_load(f)
+        
+        # Count nodes by group
+        stats = {
+            'total_hosts': len(inventory.get('all', {}).get('hosts', {})),
+            'autoscaled_nodes': len([h for h in inventory.get('all', {}).get('hosts', {}) if h.startswith('apps-')]),
+            'static_nodes': len([h for h in inventory.get('all', {}).get('hosts', {}) if not h.startswith('apps-')]),
+        }
+        
+        return jsonify({
+            'status': 'okay',
+            'stats': stats,
+            'inventory': inventory
+        }), 200
+    except Exception as e:
+        logger.error(f"Error in /inventory: {str(e)}")
+        return jsonify({'error': str(e)}), 500
 
 
 if __name__ == '__main__':
-    # Verify configuration
-    if not os.path.exists(KUBESPRAY_DIR):
-        logger.error(f"Kubespray directory not found: {KUBESPRAY_DIR}")
-        exit(1)
-    
-    if not os.path.exists(INVENTORY_FILE):
-        logger.error(f"Inventory file not found: {INVENTORY_FILE}")
-        exit(1)
-    
-    if not os.path.exists(VENV_ANSIBLE):
-        logger.error(f"Ansible venv not found: {VENV_ANSIBLE}")
-        exit(1)
-    
-    if not os.path.exists(SCALE_PLAYBOOK):
-        logger.error(f"Scale playbook not found: {SCALE_PLAYBOOK}")
-        exit(1)
-    
-    logger.info("="*60)
-    logger.info("Starting Kubespray Scale API Server...")
-    logger.info(f"Kubespray directory: {KUBESPRAY_DIR}")
+    logger.info("Starting Kubespray Scale API with Dynamic Inventory")
     logger.info(f"Inventory file: {INVENTORY_FILE}")
-    logger.info(f"Log file: {LOG_FILE}")
-    logger.info(f"Log rotation: {LOG_MAX_BYTES/1024/1024}MB per file, {LOG_BACKUP_COUNT} backups")
-    logger.info("="*60)
+    logger.info(f"Hetzner integration: {'enabled' if HCLOUD_TOKEN else 'disabled'}")
     
-    # Run the Flask app
     app.run(host='0.0.0.0', port=5000, debug=False)
